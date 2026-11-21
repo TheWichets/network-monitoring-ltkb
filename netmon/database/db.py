@@ -1,4 +1,6 @@
 import sqlite3
+import ipaddress
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -20,11 +22,12 @@ def get_connection():
     finally:
         conn.close()
 
+
 def init_db():
-    # TODO: read schema.sql and execute_script()
     with get_connection() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(SCHEMA.read_text(encoding="utf-8"))
+
 
 # ---------------------------------------------------------------- devices
 
@@ -51,115 +54,294 @@ def upsert_device(ip, mac, hostname=None):
                 status = 'up',
                 last_seen = CURRENT_TIMESTAMP
             """,
-            (hostname, ip, mac),
+            (hostname, ip, mac)
         )
         device_id = c.execute(
             "SELECT id FROM devices WHERE mac_address = ?", (mac,)
         ).fetchone()["id"]
     return device_id, is_new
 
+
 def set_device_status(device_id, status):
-    """status: 'up' / 'down'. Also update last_seen when 'up'.
-    TODO: UPDATE devices SET status=?, last_seen=... WHERE id=?
-    """
-    ...
+    #status: 'up' / 'down'. Also update last_seen when 'up'.
+    with get_connection() as c:
+        c.execute(
+            """
+            UPDATE devices 
+            SET status = ?, 
+                last_seen = CASE WHEN ? = "up" THEN CURRENT_TIMESTAMP
+                                ELSE last_seen END
+            WHERE id = ?
+            """,
+            (status, status, device_id)
+        )
 
 
 def get_device_by_ip(ip):
-    """TODO: SELECT * FROM devices WHERE ip_address=? -> row or None"""
-    ...
+    with get_connection() as c:
+        row = c.execute(
+            """
+                SELECT * FROM devices 
+                WHERE ip_address = ?
+                ORDER BY last_seen DESC
+                LIMIT 1
+            """,
+            (ip,)
+        ).fetchone()
+    return dict(row) if row else None 
 
 
 def get_devices():
-    """TODO: SELECT all devices ORDER BY ip_address -> list of dicts"""
-    ...
-
-
+    with get_connection() as c:
+        rows = c.execute(
+            "SELECT * FROM devices",
+        ).fetchall()
+    devices = [dict(r) for r in rows]
+    devices.sort(key=lambda d: ipaddress.ip_address(d["ip_address"]))
+    return devices
+            
+            
 def mark_device_known(device_id):
-    """TODO: UPDATE devices SET is_known=1 WHERE id=?"""
-    ...
+    with get_connection() as c:
+        c.execute(
+            """
+                UPDATE devices SET is_known=1 WHERE id = ?
+            """,
+            (device_id,)
+        )
 
 
 # ------------------------------------------------------------- ping logs
 
 def log_ping(device_id, status, latency_ms=None):
     """status: 'up' / 'down'; latency_ms None on timeout.
-    TODO: INSERT INTO pings_log
-    TODO: also call set_device_status() (same connection if you can)
+    Returns the device's previous status (None if the device doesn't exist).
     """
-    ...
+    with get_connection() as c:
+        row = c.execute(
+            "SELECT status FROM devices WHERE id = ?",
+            (device_id,)
+        ).fetchone()
+        previous_status = row["status"] if row else None
+        c.execute(
+            """
+                INSERT INTO pings_log (device_id, status, latency_ms)
+                VALUES (?, ?, ?)
+            """,
+            (device_id, status, latency_ms)
+        )
+        # Doesn't call set_device_status cause it opens a second connection
+        c.execute(
+            """
+                UPDATE devices
+                SET status = ?,
+                    last_seen = CASE WHEN ? = 'up' THEN CURRENT_TIMESTAMP
+                                    ELSE last_seen END
+                WHERE id = ?
+            """,
+            (status, status, device_id)
+        )
+    return previous_status
 
 
 def get_latest_ping(device_id):
-    """TODO: SELECT ... FROM pings_log WHERE device_id=? ORDER BY id DESC LIMIT 1"""
-    ...
+    """
+    Returns the device's latest ping as a dict (None if it has no pings)
+    """
+    with get_connection() as c:
+        row = c.execute(
+            """
+                SELECT ts, status, latency_ms FROM pings_log
+                WHERE device_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+            """,
+            (device_id,)
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def get_latency_history(device_id, limit=100):
     """For the dashboard chart.
-    TODO: SELECT ts, latency_ms FROM pings_log WHERE device_id=?
-          ORDER BY id DESC LIMIT ?  (reverse the list for charting)
+    Return {ts, latency_ms}, oldest first/
     """
-    ...
+    with get_connection() as c:
+        rows = c.execute(
+            """
+                SELECT ts, latency_ms FROM pings_log
+                WHERE device_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+            """,
+            (device_id, limit)
+        ).fetchall()
+    return [dict(rows) for r in reversed(rows)]
 
 
 # ------------------------------------------------------------------ ports
 
-def save_port_scan(device_id, results):
-    """results: list of (port_number, state).
-    TODO: executemany INSERT INTO ports
-    """
-    ...
+def save_port_scan(device_id, results, ts = None):
+    # Results: list of (port_number, state).
+    ts = ts or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    rows = [(device_id, ts, port, state) for port, state in results]
+    with get_connection() as c:
+        c.executemany(
+            """
+                INSERT INTO ports (device_id, ts, port_number, state)
+                VALUES (?, ?, ?, ?)
+            """,
+            rows
+        )
+    return len(rows)
 
 
 def get_last_open_ports(device_id):
-    """Used to detect new/closed ports vs. the previous scan.
-    TODO: latest scan's rows WHERE state='open'
-          (hint: find MAX(ts) for the device first)
-    """
-    ...
+    #Used to detect new/closed ports vs. the previous scan.
+
+    with get_connection() as c:
+        rows = c.execute(
+            """
+                SELECT ts, port_number FROM ports
+                WHERE device_id = ? 
+                AND state = 'open'
+                AND ts = (SELECT MAX(ts) FROM ports WHERE device_id = ?)
+            """,
+            (device_id, device_id)
+        ).fetchall()
+    return {r["port_number"] for r in rows}
 
 
 # ---------------------------------------------------------------- traffic
 
-def save_traffic(iface, bytes_sent, bytes_received, packets_sent, packets_received):
-    """TODO: INSERT INTO traffic"""
-    ...
+def save_traffic_batch(rows):
+    # Rows : list of (iface, bytes_sent, bytes_received, packets_sent, packets_received)
+    if not rows:
+        return 0
+    with get_connection() as c:
+        c.executemany(
+            """
+                INSERT INTO traffic (iface, bytes_sent, bytes_received, packets_sent, packets_received)
+                VALUES (?, ?, ?, ?, ?)
+            """,
+            (rows,)
+        )
+    return len(rows)
 
-
+    
 def get_recent_traffic(iface=None, limit=100):
-    """TODO: SELECT ... FROM traffic [WHERE iface=?] ORDER BY id DESC LIMIT ?"""
-    ...
-
+    query = """
+        SELECT ts, iface, bytes_sent, bytes_received, packets_sent, packets_received
+        FROM traffic
+    """
+    params = []
+    if iface is not None:
+        query += "WHERE iface = ?"
+        params.append(iface)
+    query += "ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+        
+    with get_connection() as c:
+        rows = c.execute(query, params).fetchall
+    return [dict[r] for r in reversed(rows)]
 
 # ----------------------------------------------------------------- events
 
 def log_event(type_, severity, message, device_id=None):
-    """type_: 'device_up', 'device_down', 'port_open', ...
+    """type_: 'new_device', 'device_down', 'device_up', 'port_open', ...
     severity: 'info' / 'warning' / 'critical'
-    TODO: INSERT INTO events
+    Returns the new event id.
     """
-    ...
+    with get_connection() as c:
+        cur = c.execute(
+            """
+            INSERT INTO events (device_id, type, severity, message)
+            VALUES (?, ?, ?, ?)
+            """,
+            (device_id, type_, severity, message),
+        )
+        event_id = cur.lastrowid
+    return event_id
 
 
-def get_recent_events(limit=50, severity=None):
-    """TODO: SELECT * FROM events [WHERE severity=?] ORDER BY id DESC LIMIT ?"""
-    ...
+def get_recent_events(limit=50, severity=None, unacknowledged_only=False):
+    """Returns a list of dicts, newest first.
+    Each event includes the device's ip_address and hostname (None if the device was deleted).
+    """
+    query = """
+        SELECT e.id, e.ts, e.device_id, e.type, e.severity, e.message, e.acknowledged,
+               d.ip_address, d.hostname
+        FROM events e
+        LEFT JOIN devices d ON d.id = e.device_id
+    """
+    conditions = []
+    params = []
+    if severity is not None:
+        conditions.append("e.severity = ?")
+        params.append(severity)
+    if unacknowledged_only:
+        conditions.append("e.acknowledged = 0")
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY e.id DESC LIMIT ?"
+    params.append(limit)
+
+    with get_connection() as c:
+        rows = c.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
 
 
 def acknowledge_event(event_id):
-    """TODO: UPDATE events SET acknowledged=1 WHERE id=?"""
-    ...
-
+    """Marks an event as acknowledged. Returns True if the event exists."""
+    with get_connection() as c:
+        cur = c.execute(
+            "UPDATE events SET acknowledged = 1 WHERE id = ?",
+            (event_id,),
+        )
+        updated = cur.rowcount > 0
+    return updated
 
 # ---------------------------------------------------------------- cleanup
 
-def purge_old_data(days=7):
-    """Keep pings_log and traffic from growing forever.
-    TODO: DELETE FROM pings_log / traffic WHERE ts < datetime('now', ?)
-          (pass f"-{days} days" as the parameter, not in the SQL string)
+def purge_old_data(days=7, event_days=30):
+    """Deletes old rows so the database doesn't grow forever.
+    Returns a dict with the number of rows deleted per table.
     """
-    ...
+    cutoff = f"-{int(days)} days"
+    event_cutoff = f"-{int(event_days)} days"
+    deleted = {}
+    with get_connection() as c:
+        deleted["pings_log"] = c.execute(
+            "DELETE FROM pings_log WHERE ts < datetime('now', ?)",
+            (cutoff,),
+        ).rowcount
+
+        deleted["traffic"] = c.execute(
+            "DELETE FROM traffic WHERE ts < datetime('now', ?)",
+            (cutoff,),
+        ).rowcount
+
+        # Keep each device's latest scan, even if it is old,
+        # so get_last_open_ports() still has something to compare against.
+        deleted["ports"] = c.execute(
+            """
+            DELETE FROM ports
+            WHERE ts < datetime('now', ?)
+              AND ts != (SELECT MAX(p.ts) FROM ports p
+                         WHERE p.device_id = ports.device_id)
+            """,
+            (cutoff,),
+        ).rowcount
+
+        # Events are the audit history, so keep them longer and only
+        # remove the ones that were already acknowledged.
+        deleted["events"] = c.execute(
+            """
+            DELETE FROM events
+            WHERE ts < datetime('now', ?) AND acknowledged = 1
+            """,
+            (event_cutoff,),
+        ).rowcount
+    return deleted
 
 
 if __name__ == "__main__":
