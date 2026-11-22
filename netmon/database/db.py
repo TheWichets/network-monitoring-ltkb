@@ -10,13 +10,13 @@ SCHEMA = BASE / "schema.sql"
 
 @contextmanager
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout = 10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
         conn.commit()
-    except:
+    except Exception:
         conn.rollback()
         raise
     finally:
@@ -69,7 +69,7 @@ def set_device_status(device_id, status):
             """
             UPDATE devices 
             SET status = ?, 
-                last_seen = CASE WHEN ? = "up" THEN CURRENT_TIMESTAMP
+                last_seen = CASE WHEN ? = 'up' THEN CURRENT_TIMESTAMP
                                 ELSE last_seen END
             WHERE id = ?
             """,
@@ -109,7 +109,6 @@ def mark_device_known(device_id):
             """,
             (device_id,)
         )
-
 
 # ------------------------------------------------------------- ping logs
 
@@ -175,20 +174,20 @@ def get_latency_history(device_id, limit=100):
             """,
             (device_id, limit)
         ).fetchall()
-    return [dict(rows) for r in reversed(rows)]
+    return [dict(r) for r in reversed(rows)]
 
 
 # ------------------------------------------------------------------ ports
 
 def save_port_scan(device_id, results, ts = None):
-    # Results: list of (port_number, state).
+    # Results: list of (port_number, proto, state, service).
     ts = ts or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    rows = [(device_id, ts, port, state) for port, state in results]
+    rows = [(device_id, ts, port, proto, state, service) for port, proto, state, service in results]
     with get_connection() as c:
         c.executemany(
             """
-                INSERT INTO ports (device_id, ts, port_number, state)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO ports (device_id, ts, port_number, proto, state, service)
+                VALUES (?, ?, ?, ?, ?, ?)
             """,
             rows
         )
@@ -201,7 +200,7 @@ def get_last_open_ports(device_id):
     with get_connection() as c:
         rows = c.execute(
             """
-                SELECT ts, port_number FROM ports
+                SELECT port_number FROM ports
                 WHERE device_id = ? 
                 AND state = 'open'
                 AND ts = (SELECT MAX(ts) FROM ports WHERE device_id = ?)
@@ -223,7 +222,7 @@ def save_traffic_batch(rows):
                 INSERT INTO traffic (iface, bytes_sent, bytes_received, packets_sent, packets_received)
                 VALUES (?, ?, ?, ?, ?)
             """,
-            (rows,)
+            rows
         )
     return len(rows)
 
@@ -235,18 +234,73 @@ def get_recent_traffic(iface=None, limit=100):
     """
     params = []
     if iface is not None:
-        query += "WHERE iface = ?"
+        query += " WHERE iface = ?"
         params.append(iface)
-    query += "ORDER BY id DESC LIMIT ?"
+    query += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
         
     with get_connection() as c:
-        rows = c.execute(query, params).fetchall
-    return [dict[r] for r in reversed(rows)]
+        rows = c.execute(query, params).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+# ------------------------------------------------------------- data_flows
+
+def save_flows(flows):
+    """flows: list of (start_ts, end_ts, src_ip, src_port, dst_ip, dst_port, protocol, packets, bytes)
+    """
+    if not flows:
+        return 0
+    with get_connection() as c:
+        c.executemany(
+            """
+            INSERT INTO flows (start_ts, end_ts, src_ip, src_port, dst_ip, dst_port,
+                               protocol, packets, bytes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            flows,
+        )
+    return len(flows)
+
+def get_top_talkers(minutes=60, limit=10):
+    with get_connection() as c:
+        rows = c.execute(
+            """
+            SELECT src_ip,
+                   SUM(bytes)   AS total_bytes,
+                   SUM(packets) AS total_packets,
+                   COUNT(*)     AS flow_count
+            FROM flows
+            WHERE start_ts >= datetime('now', ?)
+            GROUP BY src_ip
+            ORDER BY total_bytes DESC
+            LIMIT ?
+            """,
+            (f"-{int(minutes)} minutes", limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def get_fanout_hosts(minutes=10, threshold=50):
+    with get_connection() as c:
+        rows = c.execute(
+            """
+            SELECT src_ip,
+                   COUNT(DISTINCT dst_ip)   AS dest_count,
+                   COUNT(DISTINCT dst_port) AS port_count
+            FROM flows
+            WHERE start_ts >= datetime('now', ?)
+            GROUP BY src_ip
+            HAVING dest_count >= ?
+            ORDER BY dest_count DESC
+            """,
+            (f"-{int(minutes)} minutes", threshold),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
 
 # ----------------------------------------------------------------- events
 
-def log_event(type_, severity, message, device_id=None):
+def log_event(type_, severity, message, device_id=None, src_ip=None, dst_ip=None):
     """type_: 'new_device', 'device_down', 'device_up', 'port_open', ...
     severity: 'info' / 'warning' / 'critical'
     Returns the new event id.
@@ -254,10 +308,10 @@ def log_event(type_, severity, message, device_id=None):
     with get_connection() as c:
         cur = c.execute(
             """
-            INSERT INTO events (device_id, type, severity, message)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO events (device_id, type, severity, message, src_ip, dst_ip)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (device_id, type_, severity, message),
+            (device_id, type_, severity, message, src_ip, dst_ip),
         )
         event_id = cur.lastrowid
     return event_id
@@ -268,7 +322,7 @@ def get_recent_events(limit=50, severity=None, unacknowledged_only=False):
     Each event includes the device's ip_address and hostname (None if the device was deleted).
     """
     query = """
-        SELECT e.id, e.ts, e.device_id, e.type, e.severity, e.message, e.acknowledged,
+        SELECT e.id, e.ts, e.device_id, e.type, e.severity, e.message, e.acknowledged, e.src_ip, e.dst_ip,
                d.ip_address, d.hostname
         FROM events e
         LEFT JOIN devices d ON d.id = e.device_id
@@ -332,6 +386,11 @@ def purge_old_data(days=7, event_days=30):
             (cutoff,),
         ).rowcount
 
+        deleted["flows"] = c.execute(
+            "DELETE FROM flows WHERE start_ts < datetime('now', ?)",
+            (cutoff,),
+        ).rowcount
+
         # Events are the audit history, so keep them longer and only
         # remove the ones that were already acknowledged.
         deleted["events"] = c.execute(
@@ -346,4 +405,43 @@ def purge_old_data(days=7, event_days=30):
 
 if __name__ == "__main__":
     init_db()
-    # TODO: quick manual tests here (insert a device, log a ping, print rows)
+
+    # 1. insert (or update) a device
+    dev_id, is_new = upsert_device("192.168.1.10", "AA:BB:CC:DD:EE:FF", "test-pc")
+    print("device:", dev_id, "new" if is_new else "existing")
+
+    # 2. log pings (one up, one timeout)
+    print("previous status:", log_ping(dev_id, "up", 1.8))
+    print("previous status:", log_ping(dev_id, "down", None))
+
+    # 3. log a port scan
+    save_port_scan(
+        dev_id, 
+        [
+            (22,  "tcp", "closed", "ssh"),
+            (80,  "tcp", "open",   "http"),
+            (443, "tcp", "open",   "https"),
+        ]
+    )
+    print("open ports:", get_last_open_ports(dev_id))
+
+    # 4. log traffic and a flow
+    save_traffic_batch([("eth0", 1000, 2000, 10, 20)])
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    save_flows([(now, now, "192.168.1.10", 51000, "8.8.8.8", 53, "UDP", 2, 150)])
+
+    # 5. log and acknowledge an event
+    event_id = log_event("device_down", "warning", "test-pc stopped responding", dev_id)
+    acknowledge_event(event_id)
+
+    # 6. print what is in the database
+    print("\n--- devices ---")
+    for d in get_devices():
+        print(d)
+    print("--- latency history ---")
+    print(get_latency_history(dev_id))
+    print("--- top talkers ---")
+    print(get_top_talkers(minutes=60))
+    print("--- events ---")
+    for e in get_recent_events(limit=5):
+        print(e)
